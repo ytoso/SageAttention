@@ -32,6 +32,10 @@ We recommend to install: (the kernel will be faster a little)
 `torch>=2.4.0`  
 `triton-nightly`
 
+```
+pip install torch torchvision triton diffusers transformers accelerate tiktoken sentencepiece protobuf opencv-python debugpy
+```
+
 
 ## Installation
 Install using pip:  

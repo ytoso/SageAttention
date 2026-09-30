@@ -217,3 +217,127 @@ We provide a benchmarking script to compare the speed of different kernels inclu
   year={2025}
 }
 ```
+
+---
+
+## Local Setup Log (2x RTX 4080 SUPER, 2026-09-30)
+
+Steps used to build and run this repo from scratch on a machine with 2x RTX 4080 SUPER
+(sm_89, 16 GB each), Ubuntu 24.04, driver 580.65.06. The system CUDA toolkit is 12.0, which
+is too old (FP8 on Ada needs >= 12.4, SageAttention2++ needs >= 12.8), so CUDA 12.8 is
+installed via conda-forge inside a mamba environment.
+
+### 1. Create the environment (mamba)
+
+```bash
+export MAMBA_ROOT_PREFIX=$HOME/.local/share/mamba
+mamba create -y -p $MAMBA_ROOT_PREFIX/envs/sageattention -c conda-forge python=3.10
+mamba install -y -p $MAMBA_ROOT_PREFIX/envs/sageattention -c conda-forge -c nvidia cuda-toolkit=12.8
+```
+
+After this, `<prefix>/bin/nvcc` is 12.8.93. All later commands use
+`P=$MAMBA_ROOT_PREFIX/envs/sageattention` explicitly instead of activating the env.
+
+### 2. Install PyTorch (CUDA 12.8 build)
+
+`download.pytorch.org` was extremely slow from this machine (~0.5 MB/s), so the torch wheel
+came from the Aliyun pytorch-wheels mirror and the dependencies from the TUNA PyPI mirror:
+
+```bash
+P=$MAMBA_ROOT_PREFIX/envs/sageattention
+$P/bin/pip install \
+  "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0%2Bcu128-cp310-cp310-manylinux_2_28_x86_64.whl" \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+Result: `torch 2.11.0+cu128`, `triton 3.6.0`, plus the `nvidia-*-cu12` wheels
+(cudnn 9.19, nccl 2.28.9, cublas 12.8, ...). Note that installing torch also downgrades
+`setuptools` to `<82`, as required by its metadata.
+
+### 3. Install the example dependencies
+
+```bash
+$P/bin/pip install ninja numpy "diffusers>=0.35" "transformers>=4.49" accelerate safetensors \
+  sentencepiece protobuf ftfy imageio imageio-ffmpeg pillow tqdm debugpy \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 4. Build SageAttention from source (sm_89)
+
+The conda-forge gcc 14.4 toolchain is rejected by CUDA 12.8 (torch requires a host compiler
+below gcc 14), so the system gcc 13.3 is used instead:
+
+```bash
+cd SageAttention
+P=$MAMBA_ROOT_PREFIX/envs/sageattention
+export CUDA_HOME=$P
+export PATH=$P/bin:$PATH           # env nvcc 12.8 + ninja
+export CC=/usr/bin/gcc-13
+export CXX=/usr/bin/g++-13
+export TORCH_CUDA_ARCH_LIST="8.9"  # RTX 4080 SUPER is sm_89
+export MAX_JOBS=24
+$P/bin/pip install . --no-build-isolation --no-deps
+```
+
+This installs `sageattention 2.2.0` with the `_qattn_sm80`, `_qattn_sm89` and `_fused`
+extensions compiled for sm_89 (~7 min with 24 parallel jobs).
+
+### 5. Verification (RTX 4080 SUPER, fp16, HND)
+
+Correctness vs `F.scaled_dot_product_attention`, `(2, 8, seq, head_dim)`:
+
+| case | max abs err |
+|---|---|
+| non-causal, hd 64/128, seq 1024-8192 | 0.005 - 0.020 |
+| causal, hd 64/128, seq 1024-8192 | 0.10 - 0.15 (concentrated in the first rows), mean err 0.0015 |
+
+The larger causal error is expected behavior of 8-bit PV quantization, not a bug: for causal
+attention the first rows attend to only 1-2 keys, so the FP8 error on `V` cannot average out
+(row 0 output is just the quantized `v[0]`). Rows later in the sequence converge to the same
+accuracy as the non-causal case. Use the FP16-PV path
+(`sageattn_qk_int8_pv_fp16_cuda`) if this matters for your model.
+
+Speed (`b=4, h=32`, fp16), vs SDPA:
+
+| head_dim | seq_len | causal | SageAttention | SDPA | speedup | TOPS |
+|---|---|---|---|---|---|---|
+| 64 | 4096 | no | 2.92 ms | 5.48 ms | 1.87x | 188 |
+| 64 | 16384 | no | 35.96 ms | 86.66 ms | 2.41x | 245 |
+| 128 | 4096 | no | 5.62 ms | 10.86 ms | 1.93x | 196 |
+| 128 | 16384 | no | 66.33 ms | 171.27 ms | 2.58x | 265 |
+| 128 | 16384 | yes | 38.14 ms | 88.50 ms | 2.32x | 231 |
+
+### 6. Run the plug-and-play example (CogVideoX-2b)
+
+The weights were already in the local HF cache (with `HF_ENDPOINT=https://hf-mirror.com`):
+
+```bash
+cd example
+$P/bin/python cogvideox_infer.py --model cogvideox-2b --attention_type sage --start 0 --end 1
+$P/bin/python cogvideox_infer.py --model cogvideox-2b --attention_type sdpa --start 0 --end 1
+```
+
+50 denoising steps, 49 frames, 720x480, one prompt (`--start 0 --end 1`):
+
+| attention | s/it | wall time |
+|---|---|---|
+| sage | 1.89 | 119 s |
+| sdpa | 2.84 | 160 s |
+
+=> ~1.5x end-to-end speedup. Videos are written to
+`example/videos/cogvideox-2b/<attention_type>/0.mp4`. Note that the outputs are not
+frame-identical even with a fixed seed, because small numerical differences between the two
+attention implementations compound over the sampling trajectory. `--compile` was not used for
+these runs (the first compiled run would additionally pay a `max-autotune` warmup cost).
+
+### 7. Remote debugging
+
+```bash
+cd example
+$P/bin/python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
+  cogvideox_infer.py --model cogvideox-2b --attention_type sage --start 0 --end 1
+```
+
+Attach from VS Code/PyCharm with type `debugpy`, request `attach`, host `<host-ip>`, port
+`5678`. `--wait-for-client` blocks until the debugger is attached; drop it to only debug
+after startup.
